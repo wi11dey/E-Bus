@@ -39,6 +39,7 @@
 (require 'seq)
 (require 'gv)
 (require 'cl-lib)
+(require 'semantic/wisent)
 
 (defgroup ebus
   :group 'dbus)
@@ -66,49 +67,71 @@
 		  (_ (signal 'ebus-client-error
 			     (format-message "Invalid boolean value `%S' provided" b))))))
 
-(defconst ebus-basic-types
-  '(?y ?b ?n ?q ?i ?u ?x ?t ?d ?h ?s ?o ?g))
+(defmacro ebus--pop (place)
+  `(or (pop ,place)
+       (throw 'incomplete nil))
+  (or (pop chars)))
 
-(defun ebus-signature-to-bindat (signature le)
+(bindat-defmacro ebus-dict (key value &optional le)
+  `(struct
+    (a ebus-array
+       (struct
+	(key   ,@key)
+	(value ,@value))
+       ,le)
+    :unpack-val (seq-into a 'list)))
+
+(defvar ebus-le nil)
+(defconst ebus-signature-grammar
+  (wisent-compiled-grammar
+   (nil
+    nil
+    (basic ((?y) `(u8))
+	   ((?b) `(ebus-boolean ,ebus-le))
+	   ((?n) `(sint 16      ,ebus-le))
+	   ((?q) `(uint 16      ,ebus-le))
+	   ((?i) `(sint 32      ,ebus-le))
+	   ((?u) `(uint 32      ,ebus-le))
+	   ((?x) `(sint 64      ,ebus-le))
+	   ((?t) `(uint 64      ,ebus-le))
+	   ((?d) `(ebus-double  ,ebus-le))
+	   ((?h) `(uint 32      ,ebus-le))
+	   ((?s) `(strz))
+	   ((?o) `(type ebus-object-bindat-spec))
+	   ((?g) `(type ebus-signature-bindat-spec)))
+    (type ((basic))
+	  ((array))
+	  ((struct))
+	  ((variant))
+	  ((dict)))
+    (types ((type)
+	    (list $1))
+	   ((type types)
+	    (cons $1 $2)))
+    (array ((?a type)
+	    `(ebus-array ,$2 ,ebus-le)))
+    (struct ((?\( types ?\))
+	     (cons 'struct
+		   (seq-map-indexed
+		    (lambda (type i)
+		      (cons (intern (format "field%d" i)) type))
+		    $2))))
+    (variant ((?v) `(type ebus-variant-bindat-spec)))
+    (dict ((?a ?\{ basic type ?\})
+	   `(ebus-dict ,$2 ,$3 ,ebus-le))))
+   (types)))
+
+(defun ebus-signature-to-bindat (signature &optional le)
   "SIGNATURE is a single complete type.
 
 Returns a Bindat type expression."
-  (let ((chars (string-to-list signature)))
-    (named-let next ()
-      (pcase (pop chars)
-	(?y '(u8))
-	(?b `(ebus-boolean ,le))
-	(?n `(sint 16      ,le))
-	(?q `(uint 16      ,le))
-	(?i `(sint 32      ,le))
-	(?u `(uint 32      ,le))
-	(?x `(sint 64      ,le))
-	(?t `(uint 64      ,le))
-	(?d `(ebus-double  ,le))
-	(?h
-	 ;; unix fd handle?
-	 t)
-	(?s `(strz))
-	(?o `(type ebus-object-bindat-spec))
-	(?g `(type ebus-signature-bindat-spec))
-	(?a
-	 ;; array
-	 t)
-	(?\(
-	 ;; struct
-	 (struct)
-	 t)
-	(?\)
-	 nil)
-	(?\{
-	 ;; dict entry
-	 (let ((key (next))))
-	 )
-	(?\}
-	 )
-	(nil
-	 (signal ))
-	))))
+  (let ((tokens (string-to-list signature))
+	(ebus-le le))
+    (wisent-parse
+     ebus-signature-grammar
+     (lambda ()
+       (list (or (pop tokens)
+		 wisent-eoi-term))))))
 
 ;; From https://github.com/skeeto/bitpack, which is in the public domain: 
 (defun ebus--unpack-double (bytes)
@@ -260,17 +283,18 @@ Returns a Bindat type expression."
   (bindat-type
     (endianness   u8)
     (le           unit
-		  (pcase endianness
-		    (?l t)
-		    (?B nil)
-		    (_ (signal 'ebus-client-error
-			       (format-message "Invalid endianness marker `%c'"
-					       endianness)))))
+		  (setq ebus-le (pcase endianness
+				  (?l t)
+				  (?B nil)
+				  (_ (signal 'ebus-client-error
+					     (format-message "Invalid endianness marker `%c'"
+							     endianness))))))
     (message-type u8)
     (flags        u8)
     (version      u8)
     (length       uint 32 le)
     (serial       uint 32 le)
+    ;; TODO replace with ebus-dict
     (fields       (struct
 		   (a ebus-array
 		      (struct
