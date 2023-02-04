@@ -3,7 +3,7 @@
 ;; Author: Will Dey
 ;; Maintainer: Will Dey
 ;; Version: 1.0.0
-;; Package-Requires: ((rec-mode "1.9.0"))
+;; Package-Requires: ()
 ;; Homepage: homepage
 ;; Keywords: keywords
 
