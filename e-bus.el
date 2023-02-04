@@ -52,11 +52,21 @@
   ""
   :type 'string)
 
+(defvar ebus-client-prefix " *E-Bus client*")
+
 (defcustom ebus-authentication-failure-limit 20
   "")
 
-(defvar ebus-client-prefix " *E-Bus client*")
+(defcustom ebus-use-threads (featurep 'threads)
+  ""
+  :type 'boolean)
 
+(define-error 'ebus-error "E-Bus received invalid message from client")
+
+
+;;; Marshaling
+
+;;;; Basic types
 (bindat-defmacro ebus-boolean (le)
   `(struct
     :pack-var b
@@ -64,74 +74,8 @@
     :unpack-val (pcase b
 		  (0 nil)
 		  (1 t)
-		  (_ (signal 'ebus-client-error
+		  (_ (signal 'ebus-error
 			     (format-message "Invalid boolean value `%S' provided" b))))))
-
-(defmacro ebus--pop (place)
-  `(or (pop ,place)
-       (throw 'incomplete nil))
-  (or (pop chars)))
-
-(bindat-defmacro ebus-dict (key value &optional le)
-  `(struct
-    (a ebus-array
-       (struct
-	(key   ,@key)
-	(value ,@value))
-       ,le)
-    :unpack-val (seq-into a 'list)))
-
-(defvar ebus-le nil)
-(defconst ebus-signature-grammar
-  (wisent-compiled-grammar
-   (nil
-    nil
-    (basic ((?y) `(u8))
-	   ((?b) `(ebus-boolean ,ebus-le))
-	   ((?n) `(sint 16      ,ebus-le))
-	   ((?q) `(uint 16      ,ebus-le))
-	   ((?i) `(sint 32      ,ebus-le))
-	   ((?u) `(uint 32      ,ebus-le))
-	   ((?x) `(sint 64      ,ebus-le))
-	   ((?t) `(uint 64      ,ebus-le))
-	   ((?d) `(ebus-double  ,ebus-le))
-	   ((?h) `(uint 32      ,ebus-le))
-	   ((?s) `(strz))
-	   ((?o) `(type ebus-object-bindat-spec))
-	   ((?g) `(type ebus-signature-bindat-spec)))
-    (type ((basic))
-	  ((array))
-	  ((struct))
-	  ((variant))
-	  ((dict)))
-    (types ((type)
-	    (list $1))
-	   ((type types)
-	    (cons $1 $2)))
-    (array ((?a type)
-	    `(ebus-array ,$2 ,ebus-le)))
-    (struct ((?\( types ?\))
-	     (cons 'struct
-		   (seq-map-indexed
-		    (lambda (type i)
-		      (cons (intern (format "field%d" i)) type))
-		    $2))))
-    (variant ((?v) `(type ebus-variant-bindat-spec)))
-    (dict ((?a ?\{ basic type ?\})
-	   `(ebus-dict ,$2 ,$3 ,ebus-le))))
-   (types)))
-
-(defun ebus-signature-to-bindat (signature &optional le)
-  "SIGNATURE is a single complete type.
-
-Returns a Bindat type expression."
-  (let ((tokens (string-to-list signature))
-	(ebus-le le))
-    (wisent-parse
-     ebus-signature-grammar
-     (lambda ()
-       (list (or (pop tokens)
-		 wisent-eoi-term))))))
 
 ;; From https://github.com/skeeto/bitpack, which is in the public domain: 
 (defun ebus--unpack-double (bytes)
@@ -189,15 +133,88 @@ Returns a Bindat type expression."
 	(d str ,len-sym
 	   :pack-val
 	   (let ((d (ebus--pack-double double)))
-	     (if ,le-sym
-		 (nreverse d)
-	       d)))
+	     (if ,le-sym (nreverse d) d)))
 	:unpack-val
 	(ebus--unpack-double
-	 (if ,le-sym
-	     (nreverse d)
-	   d))))))
+	 (if ,le-sym (nreverse d) d))))))
 
+(defconst ebus-object-path-regex
+  (rx string-start
+      (or ?/ ; Root path.
+	  (+ ?/
+	     (+ (any (?A . ?Z)
+		     (?a . ?z)
+		     (?0 . ?9)
+		     ?_))))
+      string-start)
+  "Regular expression matching valid D-Bus object paths.")
+(defconst ebus-object-bindat-spec
+  (bindat-type
+    :pack-var o
+    (o strz :pack-val o)
+    :unpack-val
+    (if (string-match-p o)
+	o
+      (signal 'ebus-error
+	      (format-message "Invalid object path `%s' provided"
+			      o)))))
+
+(defvar ebus-le nil)
+(defconst ebus-signature-grammar
+  (wisent-compiled-grammar
+   (nil
+    nil
+    (basic ((?y) `(u8))
+	   ((?b) `(ebus-boolean ,ebus-le))
+	   ((?n) `(sint 16      ,ebus-le))
+	   ((?q) `(uint 16      ,ebus-le))
+	   ((?i) `(sint 32      ,ebus-le))
+	   ((?u) `(uint 32      ,ebus-le))
+	   ((?x) `(sint 64      ,ebus-le))
+	   ((?t) `(uint 64      ,ebus-le))
+	   ((?d) `(ebus-double  ,ebus-le))
+	   ((?h) `(uint 32      ,ebus-le))
+	   ((?s) `(strz))
+	   ((?o) `(type ebus-object-bindat-spec))
+	   ((?g) `(type ebus-signature-bindat-spec)))
+    (type ((basic))
+	  ((array))
+	  ((struct))
+	  ((variant))
+	  ((dict)))
+    (types ((type)
+	    (list $1))
+	   ((type types)
+	    (cons $1 $2)))
+    (array ((?a type)
+	    `(ebus-array ,$2 ,ebus-le)))
+    (struct ((?\( types ?\))
+	     (cons 'struct
+		   (seq-map-indexed
+		    (lambda (type i)
+		      (cons (intern (format "field%d" i)) type))
+		    $2))))
+    (variant ((?v) `(type ebus-variant-bindat-spec)))
+    (dict ((?a ?\{ basic type ?\})
+	   `(ebus-dict ,$2 ,$3 ,ebus-le))))
+   (types)))
+(defun ebus-signature-to-bindat (signature &optional le)
+  "SIGNATURE is a D-Bus signature of one or more complete types.
+
+Returns a Bindat type expression."
+  (let ((tokens (string-to-list signature))
+	(ebus-le le))
+    (wisent-parse
+     ebus-signature-grammar
+     (lambda ()
+       (list (or (pop tokens)
+		 wisent-eoi-term))))))
+(bindat-defmacro ebus-signature-bindat-spec (le)
+  `(struct
+    (s strz)
+    :unpack-val (ebus-signature-to-bindat s ,le)))
+
+;;;; Containers
 (defun ebus-alignment (&rest type)
   "TYPE is a Bindat type expression"
   (pcase type
@@ -211,47 +228,8 @@ Returns a Bindat type expression."
      8)
     (_ 1)))
 
-(defconst ebus-object-path-regex
-  (rx string-start
-      (or ?/ ; Root path.
-	  (+ ?/
-	     (+ (any (?A . ?Z)
-		     (?a . ?z)
-		     (?0 . ?9)
-		     ?_))))
-      string-start)
-  "")
-
-(defconst ebus-object-bindat-spec
-  (bindat-type
-    :pack-var o
-    (o strz
-       :pack-val
-       (if (string-match-p o)
-	   o
-	 (signal 'ebus-user-error
-		 (format-message "Invalid object path `%s' provided"
-				 o))))
-    :unpack-val
-    (if (string-match-p o)
-	o
-      (signal 'ebus-client-error
-	      (format-message "Invalid object path `%s' provided"
-			      o)))))
-
-(bindat-defmacro ebus-signature-bindat-spec (le)
-  `(struct
-    (s strz)
-    :unpack-val (ebus-signature-to-bindat s ,le)))
-
-(defconst ebus-variant-bindat-spec
-  (bindat-type
-    :pack-var v
-    (signature type ebus-signature-bindat-spec)
-    (_         align (ebus-alignment signature))
-    (v         signature
-	       :pack-val (bindat-pack signature v))
-    :unpack-val v))
+(bindat-defmacro ebus-aligned (type le)
+  )
 
 (bindat-defmacro ebus-array (type le)
   `(struct
@@ -263,9 +241,28 @@ Returns a Bindat type expression."
 	    :pack-val (seq-into a 'vector))
     :unpack-val a))
 
-(define-error ebus-error        "E-Bus (un)marshaling error")
-(define-error ebus-user-error   "E-Bus could not marshal provided message" '(ebus-error user-error))
-(define-error ebus-client-error "E-Bus received invalid message from client" 'ebus-error)
+(defconst ebus-variant-bindat-spec
+  (bindat-type
+    :pack-var v
+    (signature type ebus-signature-bindat-spec)
+    (_         align (ebus-alignment signature))
+    (v         signature
+	       :pack-val (bindat-pack signature v))
+    :unpack-val v))
+
+(bindat-defmacro ebus-dict (key value &optional le)
+  `(struct
+    (a ebus-array
+       (struct
+	:pack-var entry
+	(key   ,@key   :pack-val (car entry))
+	(value ,@value :pack-val (cdr entry))
+	:unpack-val (cons key value))
+       ,le)
+    :unpack-val (seq-into a 'list)))
+
+
+;;; Message protocol
 
 (defconst ebus-header-fields
   [invalid
@@ -286,7 +283,7 @@ Returns a Bindat type expression."
 		  (setq ebus-le (pcase endianness
 				  (?l t)
 				  (?B nil)
-				  (_ (signal 'ebus-client-error
+				  (_ (signal 'ebus-error
 					     (format-message "Invalid endianness marker `%c'"
 							     endianness))))))
     (message-type u8)
@@ -295,49 +292,24 @@ Returns a Bindat type expression."
     (length       uint 32 le)
     (serial       uint 32 le)
     ;; TODO replace with ebus-dict
-    (fields       (struct
-		   (a ebus-array
-		      (struct
-		       :pack-var field
-		       (code  u8
-			      :pack-val
-			      (let ((index (seq-position ebus-header-fields
-							 (car field)
-							 #'eq)))
-				(if (and number
-					 (> number 0))
-				    index
-				  (signal 'ebus-user-error
-					  (format-message "`%S' is not a D-Bus header field"
-							  (car field))))))
-		       (value type ebus-variant-bindat-spec
-			      :pack-val (cdr field))
-		       :unpack-val
-		       (cons (pcase code
-			       (0
-				(signal 'ebus-client-error
-					"Field with name `invalid' in message header"))
-			       ((pred (<= (length a)))
-				(signal 'ebus-client-error
-					(format-message "Unknown field code %d in message header"
-							code)))
-			       (_
-				(aref ebus-header-fields code)))
-			     value))
-		      le)
-		   :unpack-val (seq-into a 'list)))
+    (fields       ebus-dict
+		  (struct
+		   :pack-var key
+		   (code u8
+			 :pack-val
+			 (let ((index (seq-position ebus-header-fields key #'eq)))
+			   (if (and number (> number 0))
+			       index
+			     (error "`%S' is not a D-Bus header field" key))))
+		   :unpack-val
+		   (pcase code
+		     (0                      (signal 'ebus-error "Field with name `invalid' in message header"))
+		     ((pred (<= (length a))) (signal 'ebus-error (format-message "Unknown field code %d in message header" code)))
+		     (_                      (aref ebus-header-fields code))))
+		  (type ebus-variant-bindat-spec)
+		  le)
     (_            align 8)
     (body         bits length)))
-
-(defun ebus--next-line ()
-  (condition-case nil
-      (buffer-substring-no-properties
-       (point)
-       (progn
-	 (search-forward "\r\n")
-	 (match-beginning 0)))
-    (search-failed
-     (throw 'incomplete nil))))
 
 (defvar bindat-idx)
 (defvar bindat-raw)
@@ -360,14 +332,26 @@ Returns a Bindat type expression."
     (args-out-of-range
      (throw 'incomplete nil))))
 
+
+;;; Authentication protocol
+
+(defun ebus--next-line ()
+  (condition-case nil
+      (buffer-substring-no-properties
+       (point)
+       (progn
+	 (search-forward "\r\n")
+	 (match-beginning 0)))
+    (search-failed
+     (throw 'incomplete nil))))
+
 (defun ebus--send (client string)
   (when (buffer-live-p (process-buffer client))
     (with-current-buffer (process-buffer client)
       (insert string)
       (process-send-string client string))))
 
-(define-error 'ebus-auth "E-Bus client failed authentication" 'ebus-client-error)
-
+(define-error 'ebus-auth "E-Bus client failed authentication" 'ebus-error)
 (defun ebus--filter (client string)
   (catch 'incomplete
     (let* ((name (process-name client))
@@ -381,7 +365,7 @@ Returns a Bindat type expression."
 		;; Check if first byte is \0:
 		(unless (string-prefix-p "\0" string)
 		  ;; Drop connection if not:
-		  (signal 'ebus-client-error "Did not start connection with null byte"))
+		  (signal 'ebus-error "Did not start connection with null byte"))
 		(setf string (substring string 1)
 		      client-buffer (get-buffer-create client-buffer-name)
 		      (process-buffer client) client-buffer)
@@ -406,7 +390,7 @@ Returns a Bindat type expression."
 		     ((pred (string-prefix-p "AUTH"))
 		      (signal 'ebus-auth "Unsupported authentication mechanism"))
 		     ("BEGIN"
-		      (signal 'ebus-client-error "Client tried to begin messaging before finishing authentication"))
+		      (signal 'ebus-error "Client tried to begin messaging before finishing authentication"))
 		     ("ERROR"
 		      (signal 'ebus-auth "Client experienced an error"))
 		     (_
@@ -424,20 +408,19 @@ Returns a Bindat type expression."
 	       (ebus--send client "REJECTED EXTERNAL\r\n")
 	       (when (> (cl-incf (process-get client :rejected))
 			ebus-authentication-failure-limit)
-		 (signal 'ebus-client-error
+		 (signal 'ebus-error
 			 (format-message "Client was rejected %d times"
 					 (process-get client :rejected)))))))
-	(ebus-client-error
+	(ebus-error
 	 (delete-process client)
 	 (display-warning 'ebus (format-message "%s: %s; dropping connection"
 						name (cdr e))))))))
 
+
+;;; Message bus
+
 (defun ebus--dispatch (client message)
   )
-
-(defun ebus--receive ()
-  (while (progn
-	   (accept-process-output (get-process (thread-name))))))
 
 (defun ebus--sentinel (client event)
   (when (and (process-live-p client)
@@ -461,13 +444,20 @@ Returns a Bindat type expression."
 	(if moving
 	    (goto-char (process-mark proc)))))))
 
-(make-network-process
- :name "E-Bus"
- :buffer ebus-log-buffer
- :filter ebus--filter
- :server t
- :family 'local
- :service ebus-socket
- :plist '(:state WaitingForAuth))
+;;;###autoload
+(defun ebus (&optional on)
+  (with-file-modes ?\700
+    (make-network-process
+     :name "E-Bus"
+     :buffer ebus-log-buffer
+     :filter ebus--filter
+     :server t
+     :family 'local
+     :service ebus-socket
+     :plist '(:state WaitingForAuth))))
+
+(define-minor-mode ebus-mode
+  :global t
+  (ebus ebus-mode))
 
 ;;; e-bus.el ends here
